@@ -1,0 +1,375 @@
+# ТЗ на MVP модуля «ГО» — 15 календарных дней
+
+## 1. Цель и границы
+
+**Цель:** сдать работающий MVP модуля «Гражданская оборона», покрывающий ядро учёта СИЗ, НФГО и базовую отчётность перед МЧС. Всё, что не входит в MVP, фиксируется в разделе 2 как исключение и реализуется отдельным этапом.
+
+**Формат сдачи:** Docker Compose с приложением, PostgreSQL, Redis, Nginx; миграции, seed-данные, тесты, README, инструкция по развёртыванию. Код в Git с защищённой веткой `main`, PR-ревью, CI-сборка.
+
+**Ограничения:** 15 дней, один разработчик, стек Go + PostgreSQL + Redis + Git + Docker.
+
+---
+
+## 2. Объём MVP
+
+### 2.1. Входит в MVP
+
+| № | Модуль | Объём |
+|---|---|---|
+| 1 | Аутентификация и RBAC | JWT-сессии в Redis, 4 роли |
+| 2 | Сотрудники и подразделения | CRUD, табельный номер, статус, размеры СИЗ |
+| 3 | Справочник СИЗ | CRUD номенклатуры |
+| 4 | Партии и экземпляры СИЗ | Партии, экземпляры, место хранения |
+| 5 | Складской учёт | Остатки, резервирование, блокировка просрочки |
+| 6 | Движения СИЗ | Выдача, возврат, списание |
+| 7 | НФГО | Звенья, состав, командир, права |
+| 8 | Документы | Ведомость выдачи, акт списания (PDF/CSV) |
+| 9 | Отчёт для МЧС | Снапшот + CSV/PDF |
+| 10 | Аудит | Append-only журнал изменений |
+| 11 | Уведомления | Внутренние + email, планировщик сроков |
+| 12 | Инфраструктура | Docker, миграции, backup, CI, тесты |
+
+### 2.2. НЕ входит в MVP (исключено явно)
+
+- УКЭП и юридически значимый документооборот
+- ПЭП в личном кабинете
+- SMS/Push и кнопка «Сбор формирования»
+- Интеграция с 1С
+- Закупки, НМЦК, план освежения
+- Утилизация и экологические акты
+- Полный модуль защитных сооружений (только справочник)
+- Эвакуация, маршруты, транспорт (только справочники мест размещения)
+- Журнал обучения (кроме справочной таблицы занятий)
+- «Красный пакет», военное время, спецзащита
+- XML/JSON для МЧС
+- QR/штрихкоды (только поле под номер)
+- Массовое редактирование (только bulk через CSV-импорт)
+- Мобильное приложение, фотофиксация
+
+**Правило:** любое требование вне раздела 2.1 не принимается в приёмке MVP и переносится в backlog.
+
+---
+
+## 3. Архитектура и стек
+
+### 3.1. Стек
+- **Язык:** Go 1.22+
+- **HTTP:** `chi`
+- **БД:** PostgreSQL 16, драйвер `pgx/v5`, `sqlc` для запросов, `golang-migrate` для миграций
+- **Кэш/сессии/блокировки:** Redis 7, `go-redis`
+- **Логи:** `slog` в JSON
+- **Конфиг:** env + `.env.example`
+- **Документы:** HTML-шаблоны + `chromedp` (headless Chrome) для PDF, либо `gofpdf` для простых таблиц (по выбору — фиксируется в README)
+- **Хранилище файлов:** локальный volume (MinIO — опционально, если успеваем)
+- **Тесты:** `go test`, `testcontainers-go` для интеграционных, `httptest` для API
+- **CI:** GitLab CI / GitHub Actions — сборка, vet, линт, тесты, сборка образа
+
+### 3.2. Структура репозитория
+```
+/cmd/api
+/internal/auth
+/internal/employees
+/internal/items
+/internal/stock
+/internal/movements
+/internal/nfgo
+/internal/documents
+/internal/reports
+/internal/audit
+/internal/notifications
+/internal/platform/{db,redis,logger,http}
+/migrations
+/openapi
+/deploy/docker-compose.yml
+/docs
+```
+
+### 3.3. Docker Compose
+- `app` — Go-бинарник
+- `postgres` — 16-alpine, volume
+- `redis` — 7-alpine
+- `nginx` — reverse proxy, TLS (self-signed для теста)
+- `migrate` — one-shot контейнер
+- `backup` — cron `pg_dump` в volume
+
+### 3.4. Среды
+- `dev` — локально
+- `staging` — docker compose на тестовом сервере
+- Прод — вне MVP, но compose готов.
+
+---
+
+## 4. Роли и доступ (RBAC)
+
+| Роль | Права |
+|---|---|
+| `admin` | Всё |
+| `go_officer` (уполномоченный по ГО) | Сотрудники, СИЗ, движения, НФГО, отчёты, документы |
+| `storekeeper` (кладовщик) | Партии, экземпляры, движения (выдача/возврат), остатки |
+| `commander` (командир звена НФГО) | Просмотр своего звена и его движений/ведомостей |
+| `viewer` | Только чтение справочников и отчётов |
+
+Реализация: `users`, `roles`, `user_roles`, middleware в Go, проверки на уровне хендлеров и сервисов.
+
+---
+
+## 5. Функциональные требования
+
+### 5.1. Аутентификация
+- `POST /auth/login` — логин/пароль, bcrypt.
+- JWT access (15 мин) + refresh (7 дней), refresh хранится в Redis.
+- `POST /auth/logout`, `POST /auth/refresh`.
+- Блокировка после 5 неудачных попыток (Redis counter, TTL 15 мин).
+- Пароли — только в `.env` при seed, смена через `/users/me/password`.
+
+### 5.2. Сотрудники и подразделения
+- CRUD `employees`: ФИО, табельный номер (unique), телефон, email, должность, подразделение, статус (`active`/`fired`), рост/размер для СИЗ, статус брони (bool).
+- CRUD `departments`.
+- Увольнение: `status = fired`, все выданные СИЗ помечаются к возврату (задача в очередь уведомлений).
+- Запрет выдачи уволенным.
+
+### 5.3. Справочник СИЗ
+- CRUD `item_dictionary`: категория, наименование, единица измерения, срок хранения (лет), тип защиты.
+- Seed: ГП-7, ГП-21, ПДФ-2Д, КИМГЗ, Л-1, ФПК.
+
+### 5.4. Партии и экземпляры
+- CRUD `item_batches`: `item_type_id`, партия, изготовитель, дата изготовления, срок годности (calculated), количество.
+- CRUD `items`: экземпляр партии, инвентарный номер, размер, склад/стеллаж/ячейка, статус (`in_stock`/`issued`/`written_off`), текущий владелец (nullable).
+- **Ограничение:** нельзя создать экземпляр с истёкшим сроком годности в статусе `in_stock` (trigger).
+- **Ограничение:** `quantity` партии = числу экземпляров, консистентность через транзакцию.
+
+### 5.5. Складской учёт
+- Просмотр остатков: по номенклатуре, по партии, по складу.
+- Резервирование: `POST /stock/reservations` — на экземпляр, TTL 15 мин в Redis + запись в БД.
+- Автоматическая блокировка просроченных экземпляров: `status = expired` через cron 1 раз в сутки + ручной триггер.
+- Индексы: `items(expiry_date)`, `items(status)`, `items(current_employee_id)`.
+
+### 5.6. Движения СИЗ
+- `POST /movements` — создание движения:
+  - Типы: `issue`, `return`, `write_off`.
+  - `reason`, `order_number`, `lines[]`.
+  - Валидация: экземпляры `in_stock`, `expiry_date >= today`, размер соответствует сотруднику (для масок/костюмов).
+  - Транзакция: изменение статуса экземпляров + вставка движения + аудит.
+- Просмотр истории по экземпляру и сотруднику.
+- Отмена движения — только в течение 24 ч и только `admin`.
+
+### 5.7. НФГО
+- CRUD `nfgo_units`: наименование, код МЧС, командир.
+- CRUD `nfgo_members`: звено, сотрудник, роль.
+- **Ограничение:** уникальность `(nfgo_unit_id, employee_id)`.
+- **Ограничение:** командир обязан быть членом звена.
+- Права: командир видит только своё звено и движения по нему.
+
+### 5.8. Документы (PDF/CSV)
+- **Ведомость выдачи СИЗ** — `GET /documents/issue-sheet?movement_id=...` → PDF + CSV.
+- **Акт о списании** — `GET /documents/write-off-act?movement_id=...` → PDF + CSV.
+- Шаблоны хранятся в `/templates`, рендерятся в HTML → PDF.
+- Каждый документ сохраняется как файл в `/storage/documents/{year}/{type}/{id}.pdf` и регистрируется в `documents`.
+- Повторная генерация — берётся из БД, если не изменились данные; иначе новая версия.
+
+### 5.9. Отчёт для МЧС
+- `GET /reports/mchs?year=...` — снимок данных:
+  - Таблица 1: реестр НФГО.
+  - Таблица 2: обеспеченность СИЗ.
+  - Таблица 3: подготовка (заглушка — нули, т.к. обучение вне MVP).
+- Сохранение в `report_snapshots` с JSONB полного снимка и SHA-256.
+- Экспорт PDF + CSV.
+- **Запрет выгрузки**, если есть хотя бы одна вакантная позиция (сотрудник `fired` в составе НФГО) — проверка перед формированием.
+
+### 5.10. Аудит
+- Таблица `audit_log`: `id`, `entity_type`, `entity_id`, `action`, `actor_id`, `before_json`, `after_json`, `request_id`, `ip`, `user_agent`, `created_at`, `hash_prev`, `hash_cur`.
+- Append-only: `REVOKE UPDATE, DELETE` на таблицу для всех ролей, кроме `postgres`.
+- Хэш-цепочка проверяется скриптом `make audit-verify`.
+- Пишется из сервисного слоя при каждом изменении (единая обёртка).
+
+### 5.11. Уведомления
+- Cron 1 раз в сутки:
+  - За 180 дней до истечения срока годности — уведомление `go_officer`.
+  - Уволенный сотрудник с выданными СИЗ — уведомление `go_officer` + `storekeeper`.
+- Каналы: внутренние (in-app, `GET /notifications`) + email (SMTP из env, mailhog в dev).
+- Таблица `notifications` + `outbox` (паттерн transactional outbox).
+- Redis — очередь отправки, но источник истины в Postgres.
+
+---
+
+## 6. Модель данных (минимальная для MVP)
+
+Таблицы (обязательные поля — id, created_at, updated_at; добавлю только уникальное/критичное):
+
+- `users` (email, password_hash, is_active)
+- `roles`, `user_roles`
+- `departments` (name)
+- `employees` (tab_number UQ, full_name, phone, email, position, department_id, status, size_mask, size_suit, is_reserved, fired_at)
+- `item_dictionary` (category, name, unit, shelf_life_years, protection_type)
+- `item_batches` (item_type_id, batch_number, manufacturer, manufacture_date, expiry_date, quantity)
+- `items` (item_type_id, batch_id, inventory_number UQ, size, warehouse, rack, cell, status, current_employee_id, expiry_date)
+- `stock_reservations` (item_id, reserved_by, expires_at, status)
+- `siz_movements` (movement_type, movement_date, reason, order_number, created_by)
+- `siz_movement_lines` (movement_id, item_id, employee_id, quantity, tech_state)
+- `nfgo_units` (name, mchs_code, commander_id)
+- `nfgo_members` (nfgo_unit_id, employee_id, role, UQ)
+- `documents` (doc_type, entity_type, entity_id, file_path, sha256, version, created_by)
+- `report_snapshots` (report_type, payload JSONB, sha256, created_by, created_at)
+- `notifications` (user_id, type, payload JSONB, status, sent_at)
+- `outbox` (aggregate_type, aggregate_id, event_type, payload, processed_at)
+- `audit_log` (см. 5.10)
+- `shelters` (id, inventory_number, protection_class, project_capacity, readiness_status, address) — только справочник
+- `safe_areas` (id, name, address, contact_name, contact_phone, capacity) — только справочник
+
+Индексы: `items(status)`, `items(expiry_date)`, `items(current_employee_id)`, `siz_movements(movement_date)`, `audit_log(entity_type, entity_id)`, `nfgo_members(employee_id)`.
+
+Ограничения:
+- `CHECK (quantity > 0)` в строках движений.
+- `CHECK (expiry_date >= manufacture_date)`.
+- Триггер запрета выдачи просроченного.
+- Триггер update `current_employee_id` при движении issue/return.
+
+---
+
+## 7. API (минимальный набор)
+
+```
+POST   /auth/login
+POST   /auth/logout
+POST   /auth/refresh
+GET    /users/me
+POST   /users/me/password
+
+GET    /employees?status=&department=
+POST   /employees
+GET    /employees/{id}
+PUT    /employees/{id}
+DELETE /employees/{id}            // soft, status=fired
+
+GET    /departments
+POST   /departments
+
+GET    /item-dictionary
+POST   /item-dictionary
+PUT    /item-dictionary/{id}
+
+GET    /item-batches?item_type_id=
+POST   /item-batches
+GET    /items?status=&batch_id=&employee_id=
+POST   /items
+PUT    /items/{id}
+
+GET    /stock/balances?item_type_id=
+POST   /stock/reservations
+DELETE /stock/reservations/{id}
+
+GET    /movements?type=&employee_id=
+POST   /movements
+GET    /movements/{id}
+
+GET    /nfgo-units
+POST   /nfgo-units
+GET    /nfgo-units/{id}
+PUT    /nfgo-units/{id}
+POST   /nfgo-units/{id}/members
+DELETE /nfgo-units/{id}/members/{employee_id}
+
+GET    /documents/issue-sheet?movement_id=
+GET    /documents/write-off-act?movement_id=
+GET    /documents/{id}/download
+
+GET    /reports/mchs?year=
+GET    /reports/snapshots/{id}
+GET    /reports/snapshots/{id}/download?format=pdf|csv
+
+GET    /notifications
+POST   /notifications/{id}/read
+
+GET    /audit?entity_type=&entity_id=
+
+GET    /healthz
+GET    /readyz
+GET    /metrics                // Prometheus
+```
+
+OpenAPI 3.1 в `/openapi/openapi.yaml` — обязателен, генерируется вручную и валидируется в CI.
+
+---
+
+## 8. Нефункциональные требования
+
+| Аспект | Требование |
+|---|---|
+| Производительность | p95 < 300 мс на чтение, < 800 мс на запись при 50 RPS |
+| Безопасность | bcrypt, JWT в Redis, rate limit на login, CSRF только для cookie-flow (у нас header JWT), TLS на nginx |
+| Аудит | 100% мутаций через единый сервисный хелпер |
+| Логи | JSON, level, request_id, actor_id, entity |
+| Тесты | покрытие сервисов ≥ 60%, обязательные тесты: выдача просроченного, NФГО-уникальность, отчёт-запрет-при-вакансиях, RBAC |
+| Миграции | только вверх, откат через отдельные down-скрипты, проверка в CI |
+| Backup | `pg_dump` ежедневно в volume + ротация 7 дней |
+| Секреты | только env, `.env.example` без значений, `.env` в `.gitignore` |
+| CI | `go vet`, `golangci-lint`, `go test ./...`, миграции на чистой БД, сборка образа |
+| Документация | README, `docs/architecture.md`, `docs/runbook.md`, `docs/api.md` |
+
+---
+
+## 9. Критерии приёмки MVP
+
+MVP принимается, если **все** пункты выполнены:
+
+1. `docker compose up` поднимает стек с нуля, применяет миграции, создаёт seed-данные.
+2. Логин работает для всех 5 ролей, доступ ограничен по матрице из раздела 4.
+3. Создан сотрудник, номенклатура, партия, экземпляры.
+4. Выдача СИЗ проходит транзакционно: экземпляр становится `issued`, аудит пишется, ведомость генерируется.
+5. Попытка выдать просроченный экземпляр возвращает `409` с причиной.
+6. Списание формирует акт PDF + CSV, статус `written_off`.
+7. Создано НФГО-звено с командиром и составом; дубликат участника — `409`.
+8. Отчёт МЧС формируется, снапшот сохраняется с SHA-256, PDF/CSV скачиваются.
+9. Если в НФГО есть `fired` сотрудник — отчёт блокируется с понятной ошибкой.
+10. Аудит append-only: `UPDATE`/`DELETE` отклоняются на уровне БД; `make audit-verify` проходит.
+11. Cron уведомлений отрабатывает: за 180 дней до истечения — уведомление; уволенный с СИЗ — уведомление.
+12. Все тесты зелёные, CI зелёный, README позволяет развернуть с нуля за ≤ 15 минут.
+13. OpenAPI соответствует фактическим эндпоинтам (проверка `openapi-diff` в CI).
+14. Метрики Prometheus на `/metrics`, healthcheck на `/healthz` и `/readyz`.
+
+---
+
+## 10. План по дням (реалистичный, с буфером)
+
+| День | Задачи | Артефакт |
+|---|---|---|
+| 1 | Финализация модели, миграции, скелет проекта, Docker Compose, CI | `docker compose up` работает |
+| 2 | Auth, RBAC, users/roles, middleware, JWT + Redis, rate limit | Логин/логаут, тесты |
+| 3 | Employees + departments, CRUD, статусы, размеры | CRUD + тесты |
+| 4 | Item dictionary, batches, items, seed | CRUD + тесты |
+| 5 | Stock: остатки, резервирование, блокировка просрочки, триггеры | Сервис + тесты |
+| 6 | Movements: issue/return, транзакции, валидации, аудит | Сервис + тесты |
+| 7 | Movements: write-off + акт, документы (генерация PDF/CSV) | Документы + тесты |
+| 8 | НФГО: звенья, состав, командир, права | CRUD + тесты |
+| 9 | Отчёт МЧС: снапшоты, запреты, PDF/CSV | Отчёт + тесты |
+| 10 | Audit append-only, hash chain, `audit-verify` | Аудит + тесты |
+| 11 | Notifications: outbox, cron, in-app, email (mailhog) | Уведомления + тесты |
+| 12 | OpenAPI, метрики, healthcheck, интеграционные тесты | Спецификация + метрики |
+| 13 | Docs, runbook, seed-сценарий для демо, Nginx, TLS | README/runbook |
+| 14 | Приёмочные тесты, исправление багов, `audit-verify`, backup | Green CI |
+| 15 | Демо, фиксация исключений, tag `v0.1.0`, релиз | Релиз |
+
+**Буфер:** дни 14–15 — на баги. Если что-то режется — режется пункт 9 (отчёт МЧС → CSV-only), затем пункт 11 (только in-app, email в backlog), затем пункт 8 (НФГО без прав командира — только admin).
+
+## 11. Риски и меры
+
+| Риск | Вероятность | Мера |
+|---|---|---|
+| Не успеваем PDF | Средняя | Fallback: CSV + HTML-печать, PDF — в backlog |
+| Сложность транзакций движений | Высокая | Сначала «толстый» сервис в одном пакете, потом дробление |
+| Аудит-цепочка тормозит | Низкая | Запись в фоне через outbox, но с проверкой на консистентность cron'ом |
+| RBAC протекает | Средняя | Табличные тесты «роль × эндпоинт» |
+| Docker на тестовом сервере | Низкая | Заранее подготовить сервер |
+| Cron в контейнере | Низкая | Использовать `robfig/cron` в приложении, не отдельный контейнер |
+| Email в dev | Низкая | mailhog в compose |
+
+## 12. Definition of Done
+
+- Код в `main`, PR-ревью пройдено.
+- Тесты зелёные, покрытие сервисов ≥ 60%.
+- Миграции применимы на чистой БД.
+- OpenAPI актуален.
+- `docker compose up` с нуля — работает.
+- README + runbook + architecture — в репозитории.
+- Релизный tag `v0.1.0`.
+- Исключения из раздела 2.2 зафиксированы в `docs/backlog.md` с приоритетами.

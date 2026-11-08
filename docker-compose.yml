@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: go_mchs_postgres
+    environment:
+      POSTGRES_USER: mchs_user
+      POSTGRES_PASSWORD: mchs_password
+      POSTGRES_DB: mchs_civil_defense
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/data/postgresql
+
+  redis:
+    image: redis:7-alpine
+    container_name: go_mchs_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  app:
+    build: .
+    container_name: go_mchs_app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: mchs_user
+      DB_PASSWORD: mchs_password
+      DB_NAME: mchs_civil_defense
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+volumes:
+  pgdata:
+  redisdata:
